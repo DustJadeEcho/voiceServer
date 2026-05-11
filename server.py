@@ -152,10 +152,18 @@ class VoiceServer:
 
         # TLS
         if config.MQTT_PORT == 8883 or config.MQTT_CA_CERT:
+            import ssl
             tls_kwargs = {}
             if config.MQTT_CA_CERT:
                 tls_kwargs["ca_certs"] = config.MQTT_CA_CERT
+            else:
+                # If no CA cert provided but using 8883, allow self-signed for development
+                # or use system certs with relaxed verification if needed
+                tls_kwargs["cert_reqs"] = ssl.CERT_NONE
+
             self._mqtt.tls_set(**tls_kwargs)
+            if not config.MQTT_CA_CERT:
+                self._mqtt.tls_insecure_set(True)
 
         # Callbacks
         self._mqtt.on_connect = self._on_connect

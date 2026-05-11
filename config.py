@@ -2,6 +2,10 @@
 
 import os
 import sys
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ─── MQTT ────────────────────────────────────────────────────────────────────
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
