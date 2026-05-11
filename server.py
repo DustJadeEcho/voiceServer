@@ -131,8 +131,9 @@ class VoiceServer:
                      config.MAX_SESSIONS, config.SESSION_TIMEOUT,
                      config.MAX_PCM_SIZE // (1024 * 1024))
 
+        asyncio.set_event_loop(self._loop)
         self._setup_mqtt()
-        self._msg_queue = asyncio.Queue()
+        self._msg_queue = asyncio.Queue(loop=self._loop)
 
         # Signal handlers
         for sig in (signal.SIGTERM, signal.SIGINT):
