@@ -48,7 +48,7 @@ class TTSEngine:
         if not text.strip():
             return b""
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             pcm_24k = await loop.run_in_executor(None, self._synthesize_sync, text)
             pcm_16k = resample_pcm(pcm_24k, self._native_rate, self._target_rate)
