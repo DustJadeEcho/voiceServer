@@ -11,12 +11,11 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import ssl
 import threading
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
-from time import mktime
 from urllib.parse import urlencode
 from wsgiref.handlers import format_date_time
 
@@ -31,9 +30,12 @@ FIRST_FRAME = 0
 MIDDLE_FRAME = 1
 LAST_FRAME = 2
 
-# Recommended frame size for 16kHz PCM (1280 bytes = 40ms)
+# Frame size for 16kHz PCM (1280 bytes = 40ms of audio)
 FRAME_SIZE = 1280
-FRAME_INTERVAL = 0.04  # 40ms
+# Send pacing: iFlytek docs suggest 40ms/frame (real-time), but batch upload
+# tolerates much faster — 40ms would add ~1.5s latency for a 3s clip.
+# 10ms cuts that to ~0.4s; raise via env if the API starts complaining.
+FRAME_INTERVAL = float(os.environ.get("ASR_FRAME_INTERVAL_MS", "10")) / 1000.0
 
 
 class ASREngine(ABC):
@@ -66,7 +68,7 @@ class XunfeiASR(ASREngine):
         if not self._appid:
             raise RuntimeError("XUNFEI_APPID not configured")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._recognize_sync, pcm_bytes)
 
     def _recognize_sync(self, pcm_bytes: bytes) -> str:
@@ -174,8 +176,7 @@ class XunfeiASR(ASREngine):
             ws.send(json.dumps(frame))
 
             if status == LAST_FRAME:
-                # Wait for server to process final frame
-                time.sleep(0.5)
+                time.sleep(0.2)          # 给服务端处理尾帧留量（结果靠 done_event 等）
             else:
                 time.sleep(FRAME_INTERVAL)
 
@@ -212,8 +213,10 @@ class XunfeiASR(ASREngine):
 
     def _build_auth_url(self) -> str:
         """Build authenticated WebSocket URL with HMAC-SHA256 signature."""
-        now = datetime.utcnow()
-        date = format_date_time(mktime(now.timetuple()))
+        # RFC1123 GMT date. format_date_time takes a POSIX timestamp directly —
+        # the old mktime(utcnow().timetuple()) treated a UTC tuple as local time
+        # and only worked when the server TZ happened to be UTC.
+        date = format_date_time(time.time())
 
         # Signature origin: host, date, request-line
         signature_origin = (
