@@ -49,8 +49,10 @@ class Session:
         llm: LLMClient,
         tts: TTSEngine,
         max_duration: int = 60,
+        mode: str = "ask",
     ):
         self.session_id = session_id
+        self.mode = mode              # "ask"=完整问答；"wake"=唤醒词校验（仅 ASR）
         self.state = State.IDLE
         self._publish = publish_fn
         self._asr = asr
@@ -123,7 +125,15 @@ class Session:
 
         pcm_data = self._assemble_pcm()
         if not pcm_data:
-            await self._send_error("no_audio")
+            if self.mode == "wake":
+                await self._send_wake_result(False, "(no audio)")
+            else:
+                await self._send_error("no_audio")
+            return
+
+        # 唤醒校验会话: 只跑 ASR + 词表匹配，不进 LLM/TTS（零成本拒绝误触发）
+        if self.mode == "wake":
+            await self._run_wake_check(pcm_data)
             return
 
         try:
@@ -137,6 +147,23 @@ class Session:
         except Exception as e:
             logger.error("[%s] Pipeline error: %s", self.session_id, e, exc_info=True)
             await self._send_error("internal_error")
+
+    async def _run_wake_check(self, pcm_data: bytes) -> None:
+        """唤醒词校验: ASR 短窗 → 匹配 WAKE_WORDS → 回 wake_ok / wake_no。"""
+        try:
+            text = await self._asr.recognize(pcm_data)
+        except Exception as e:
+            logger.warning("[%s] wake ASR failed: %s", self.session_id, e)
+            text = ""
+        hit = any(w in text for w in config.WAKE_WORDS)
+        await self._send_wake_result(hit, text)
+
+    async def _send_wake_result(self, hit: bool, text: str) -> None:
+        event = "wake_ok" if hit else "wake_no"
+        logger.info("[%s] wake check: %r -> %s", self.session_id, text[:40], event)
+        msg = json.dumps({"event": event, "session": self.session_id})
+        await self._publish(config.TOPIC_DOWN_CONTROL, msg.encode(), 1)  # QoS 1
+        self.state = State.DONE
 
     def _assemble_pcm(self) -> bytes:
         """Assemble PCM chunks in sequence order, detect gaps."""

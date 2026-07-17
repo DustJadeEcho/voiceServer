@@ -31,6 +31,12 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))  # 语音场景回答上限
+
+# ─── Wake word（唤醒词） ─────────────────────────────────────────────────────
+# 设备侧能量触发后先上传 ~1.5s 短窗做唤醒校验；ASR 文本命中任一词即回 wake_ok。
+# 默认含"小舟"的常见同音字（ASR 可能写成周/州/洲/粥）。
+WAKE_WORDS = [w.strip() for w in os.environ.get(
+    "WAKE_WORDS", "小舟小舟,小舟,小周,小州,小洲,小粥").split(",") if w.strip()]
 LLM_SYSTEM_PROMPT = os.environ.get(
     "LLM_SYSTEM_PROMPT",
     "你是一个友好的语音助手，请用简洁的中文回答用户的问题。回答要口语化，适合语音播放，"
