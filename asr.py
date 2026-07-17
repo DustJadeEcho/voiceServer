@@ -143,9 +143,11 @@ class XunfeiASR(ASREngine):
         ws_thread.start()
 
         # Wait for completion with timeout
-        if not done_event.wait(timeout=config.API_TIMEOUT + 5):
-            ws.close()
-            raise RuntimeError("iFlytek ASR timed out")
+        try:
+            if not done_event.wait(timeout=config.API_TIMEOUT + 5):
+                raise RuntimeError("iFlytek ASR timed out")
+        finally:
+            ws.close()      # 成功也要主动关——不关会挂到讯飞侧 15s 超时并打错误日志
 
         if error_msg[0]:
             raise RuntimeError(f"iFlytek ASR failed: {error_msg[0]}")

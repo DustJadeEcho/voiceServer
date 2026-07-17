@@ -30,6 +30,7 @@ XUNFEI_API_SECRET = os.environ.get("XUNFEI_API_SECRET", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))  # 语音场景回答上限
 LLM_SYSTEM_PROMPT = os.environ.get(
     "LLM_SYSTEM_PROMPT",
     "你是一个友好的语音助手，请用简洁的中文回答用户的问题。回答要口语化，适合语音播放，"
