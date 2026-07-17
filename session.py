@@ -66,6 +66,8 @@ class Session:
         # Downlink pacing state (token bucket over wall clock)
         self._pace_t0: float | None = None
         self._pace_sent = 0          # bytes already sent
+        self._pace_tokens = 0.0      # token bucket credit (bytes), capped at burst
+        self._pace_last = 0.0        # last refill timestamp
         self._tts_fail_streak = 0    # consecutive TTS failures
 
     @property
@@ -253,25 +255,34 @@ class Session:
     async def _send_audio_chunks(self, pcm_data: bytes, start_seq: int) -> int:
         """Send PCM as paced packets. Returns next sequence number.
 
-        Pacing: allow DOWN_BURST_SECONDS of audio to go out immediately
-        (pre-fills the MCU ring buffer), then hold to real-time rate so the
-        32 KB (1 s) ring never overflows regardless of answer length.
+        Pacing: token bucket with **capped** capacity (= DOWN_BURST_SECONDS).
+        Unlike an open-ended "burst + elapsed×rate" budget, the bucket cannot
+        accumulate credit while the network stalls — so after a transit hiccup
+        packets resume at real-time rate instead of flooding the MCU ring
+        (observed: 4 s stall → catch-up burst → ring overflow, 0.5 s dropped).
         """
         loop = asyncio.get_running_loop()
-        if self._pace_t0 is None:
+        burst_bytes = config.DOWN_BURST_SECONDS * config.DEVICE_BYTES_PER_SEC
+        if self._pace_t0 is None:                 # first send: full bucket
             self._pace_t0 = loop.time()
-            self._pace_sent = 0
+            self._pace_tokens = burst_bytes
+            self._pace_last = self._pace_t0
 
-        burst_bytes = int(config.DOWN_BURST_SECONDS * config.DEVICE_BYTES_PER_SEC)
         seq = start_seq
         for chunk in chunk_pcm(pcm_data):
-            # Time at which this chunk is allowed to leave (token bucket)
-            ahead = self._pace_sent - burst_bytes
-            if ahead > 0:
-                target = self._pace_t0 + ahead / config.DEVICE_BYTES_PER_SEC
-                delay = target - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
+            # Refill tokens at real-time rate, capped at bucket size
+            now = loop.time()
+            self._pace_tokens = min(
+                burst_bytes,
+                self._pace_tokens + (now - self._pace_last) * config.DEVICE_BYTES_PER_SEC,
+            )
+            self._pace_last = now
+            deficit = len(chunk) - self._pace_tokens
+            if deficit > 0:                       # not enough credit → wait it out
+                await asyncio.sleep(deficit / config.DEVICE_BYTES_PER_SEC)
+                self._pace_tokens = len(chunk)    # after sleep, exactly enough
+                self._pace_last = loop.time()
+            self._pace_tokens -= len(chunk)
 
             packet = encode_packet(self.session_id, seq, chunk)
             await self._publish(config.TOPIC_DOWN_AUDIO, packet, 0)  # QoS 0
