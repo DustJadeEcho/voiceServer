@@ -48,6 +48,8 @@ class LLMClient:
 
         loop = asyncio.get_running_loop()
         buffer = ""
+        t_start = loop.time()
+        first_token_at: float | None = None
 
         try:
             stream = await loop.run_in_executor(None, self._create_stream, messages)
@@ -62,6 +64,11 @@ class LLMClient:
                 token = chunk.choices[0].delta.content or ""
                 if not token:
                     continue
+                if first_token_at is None:
+                    first_token_at = loop.time()
+                    # TTFT 是整条链路延时的最大变量（上游网关/模型决定），
+                    # 常态化打印便于横向比较不同 LLM_BASE_URL/LLM_MODEL
+                    logger.info("LLM first token in %.2fs", first_token_at - t_start)
 
                 buffer += token
 
@@ -106,6 +113,7 @@ class LLMClient:
             model=self._model,
             messages=messages,
             stream=True,
+            max_tokens=config.LLM_MAX_TOKENS,   # 语音回答无需长文，截断可显著压 TTFT/总时长
         )
 
 

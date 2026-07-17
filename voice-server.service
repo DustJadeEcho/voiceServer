@@ -1,0 +1,23 @@
+[Unit]
+Description=Voice QA server (MQTT + ASR/LLM/TTS pipeline)
+After=network-online.target emqx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ↓↓ 按实际部署路径/用户修改这两行 ↓↓
+User=ubuntu
+WorkingDirectory=/opt/voiceServer
+# .env 由 python-dotenv 在 config.py 里加载，无需 EnvironmentFile
+ExecStart=/opt/voiceServer/.venv/bin/python server.py
+Restart=always
+RestartSec=3
+# 崩溃循环保护: 60s 内最多重启 10 次
+StartLimitIntervalSec=60
+StartLimitBurst=10
+# 日志进 journald（journalctl -u voice-server -f 查看）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

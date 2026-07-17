@@ -6,8 +6,8 @@ State machine:
 Latency/robustness features:
     - stop-grace: stop(QoS1) can overtake trailing audio(QoS0); wait briefly.
     - TTS pipelining: synthesize sentence N+1 while sentence N is being sent.
-    - Downlink pacing: initial burst then real-time rate, so the MCU's 2-second
-      ring buffer (64 KB) never overflows.
+    - Downlink pacing: initial burst then real-time rate, so the MCU's 1-second
+      ring buffer (32 KB) never overflows.
 """
 
 import asyncio
@@ -242,7 +242,7 @@ class Session:
 
         Pacing: allow DOWN_BURST_SECONDS of audio to go out immediately
         (pre-fills the MCU ring buffer), then hold to real-time rate so the
-        64 KB ring never overflows regardless of answer length.
+        32 KB (1 s) ring never overflows regardless of answer length.
         """
         loop = asyncio.get_running_loop()
         if self._pace_t0 is None:
