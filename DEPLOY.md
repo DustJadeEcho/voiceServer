@@ -42,14 +42,20 @@ cd /opt/voiceServer
 `MQTT connected` → `Session created: <N>` → `stop: 24 chunks` → `ASR (2.x s): 你说的话`
 → `LLM first token in X.XXs` → `TTS #0 ...` → `done: M packets`。
 
-## 5. 注册 systemd 服务（开机自启+崩溃自拉）
+## 5. 注册 systemd 服务（开机自启+崩溃自拉，定名 voice-server）
+
+⚠️ 先停掉手动跑的 `python server.py`（Ctrl+C），否则两个实例重复订阅。
+⚠️ 若装过旧名 `voiceserver`（无连字符）先清掉：`sudo systemctl disable --now voiceserver;
+sudo rm -f /etc/systemd/system/voiceserver.service; sudo systemctl daemon-reload`。
+
+仓库里的 `voice-server.service` 已按本机环境写好（用户 mcl、目录 ~/voiceServer），直接安装：
 
 ```bash
-sudo cp voice-server.service /etc/systemd/system/
-sudo nano /etc/systemd/system/voice-server.service   # 改 User/路径（若不是 /opt/voiceServer）
+sudo cp ~/voiceServer/voice-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now voice-server
-journalctl -u voice-server -f                        # 实时日志
+systemctl status voice-server --no-pager    # 期望 Active: active (running)
+journalctl -u voice-server -f               # 实时日志
 ```
 
 ## 6. 常见问题
