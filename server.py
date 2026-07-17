@@ -53,8 +53,7 @@ class SessionManager:
     def get(self, session_id: int) -> Session | None:
         return self._sessions.get(session_id)
 
-    def create(self, session_id: int, max_duration: int = 60,
-               mode: str = "ask") -> Session | None:
+    def create(self, session_id: int, max_duration: int = 60) -> Session | None:
         """Create a new session. Returns None if limit reached or duplicate."""
         if session_id in self._sessions:
             logger.warning("Duplicate session %s, ignoring start", session_id)
@@ -72,11 +71,10 @@ class SessionManager:
             llm=self._llm,
             tts=self._tts,
             max_duration=max_duration,
-            mode=mode,
         )
         self._sessions[session_id] = session
-        logger.info("Session created: %s mode=%s (%d/%d active)",
-                    session_id, mode, len(self._sessions), config.MAX_SESSIONS)
+        logger.info("Session created: %s (%d/%d active)",
+                    session_id, len(self._sessions), config.MAX_SESSIONS)
         return session
 
     def remove(self, session_id: int) -> None:
@@ -247,7 +245,6 @@ class VoiceServer:
 
         if event == "start":
             max_duration = int(msg.get("max_duration", 60))
-            mode = str(msg.get("mode", "ask"))
             # 单设备策略: 新 start 到来即作废所有旧会话——停止其残余下发
             # （设备端已换会话号，旧包只会被当 stale 丢弃，白耗带宽/串扰日志）
             for sid in self._sessions.all_ids():
@@ -258,7 +255,7 @@ class VoiceServer:
             if self._sessions.get(session_id):
                 await self._send_error_to(session_id, "duplicate_session")
                 return
-            session = self._sessions.create(session_id, max_duration, mode)
+            session = self._sessions.create(session_id, max_duration)
             if session:
                 session.start()
             else:
