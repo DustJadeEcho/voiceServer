@@ -245,6 +245,13 @@ class VoiceServer:
 
         if event == "start":
             max_duration = int(msg.get("max_duration", 60))
+            # 单设备策略: 新 start 到来即作废所有旧会话——停止其残余下发
+            # （设备端已换会话号，旧包只会被当 stale 丢弃，白耗带宽/串扰日志）
+            for sid in self._sessions.all_ids():
+                if sid != session_id:
+                    logger.info("start %d supersedes session %d, cancelling",
+                                session_id, sid)
+                    self._sessions.remove(sid)
             if self._sessions.get(session_id):
                 await self._send_error_to(session_id, "duplicate_session")
                 return

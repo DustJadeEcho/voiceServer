@@ -202,25 +202,38 @@ class Session:
             await self._send_done()
 
     async def _tts_pipeline(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Yield synthesized PCM per sentence, overlapping TTS(N+1) with send(N).
+        """Yield synthesized PCM per sentence, pipelined.
 
-        A sentence's synthesis task is created as soon as the sentence is
-        complete; the previous result is yielded (and sent, paced) while the
-        next synthesis runs in the background.
+        Producer schedules a TTS task per LLM sentence (queue maxsize bounds
+        how many syntheses run ahead — gateway-friendly). Consumer yields
+        results strictly in order, and the first sentence is released the
+        moment its own synthesis finishes — it does NOT wait for sentence 2
+        to be discovered (the old one-ahead generator did, costing latency).
         """
-        pending: asyncio.Task | None = None
+        queue: asyncio.Queue[asyncio.Task | None] = asyncio.Queue(maxsize=2)
+
+        async def producer() -> None:
+            try:
+                async for sentence in self._llm.stream_sentences(text):
+                    task = asyncio.create_task(self._tts_safe(sentence))
+                    await queue.put(task)       # maxsize 反压: 限制超前合成数
+            finally:
+                await queue.put(None)           # 结束标记（异常时也要放行消费端）
+
+        prod = asyncio.create_task(producer())
         try:
-            async for sentence in self._llm.stream_sentences(text):
-                task = asyncio.create_task(self._tts_safe(sentence))
-                if pending is not None:
-                    yield await pending
-                pending = task
-            if pending is not None:
-                yield await pending
-                pending = None
+            while True:
+                task = await queue.get()
+                if task is None:
+                    break
+                yield await task                # 逐句按序放行（完成即发）
+            await prod                          # LLM 流异常在此浮出（交给上层归类）
         finally:
-            if pending is not None:      # generator aborted mid-flight
-                pending.cancel()
+            prod.cancel()                       # 生成器被中止时清理生产者
+            while not queue.empty():
+                t = queue.get_nowait()
+                if t is not None:
+                    t.cancel()
 
     async def _tts_safe(self, sentence: str) -> bytes:
         """TTS with failure policy: skip single failures, abort after 2 in a row."""
