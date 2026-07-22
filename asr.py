@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import ssl
 import threading
 import time
@@ -46,6 +47,173 @@ class ASREngine(ABC):
         """Transcribe 16kHz/16bit/mono PCM to text."""
 
 
+class XunfeiStreamSession:
+    """Live-feed iFlytek session: connect during recording, feed chunks as they
+    arrive from the MCU, and get the final text ~0.3s after finish().
+
+    Removes the batch path's whole-clip upload + recognition wait (~1.3s).
+    All blocking work lives in two daemon threads; feed() never blocks the
+    asyncio loop, finish() is blocking and must run in an executor.
+    """
+
+    _LAST = object()          # sentinel: end of audio
+
+    def __init__(self, build_url, appid: str):
+        self._build_url = build_url
+        self._appid = appid
+        self._queue: "queue.Queue[bytes | object]" = queue.Queue()
+        self._results: list[str] = []
+        self._error: str | None = None
+        self._connected = threading.Event()
+        self._done = threading.Event()
+        self._ws: websocket.WebSocketApp | None = None
+        self._started = False
+
+    # ── lifecycle (called from asyncio thread) ───────────────────────────────
+
+    def start(self) -> None:
+        """Open the WebSocket and start the sender thread (non-blocking)."""
+        if self._started:
+            return
+        self._started = True
+        self._ws = websocket.WebSocketApp(
+            self._build_url(),
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_open=lambda ws: self._connected.set(),
+        )
+        threading.Thread(
+            target=self._ws.run_forever,
+            kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE}},
+            daemon=True, name="asr-ws",
+        ).start()
+        threading.Thread(target=self._sender, daemon=True, name="asr-send").start()
+
+    def feed(self, pcm: bytes) -> None:
+        """Queue one uplink chunk for sending (non-blocking)."""
+        if self._started and not self._done.is_set():
+            self._queue.put(pcm)
+
+    def finish(self, timeout: float = 5.0) -> str:
+        """Send last frame, wait for the final result. BLOCKING — run in executor."""
+        if not self._started:
+            raise RuntimeError("stream not started")
+        self._queue.put(self._LAST)
+        if not self._done.wait(timeout=timeout):
+            self._error = self._error or "final result timeout"
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+        if self._error:
+            raise RuntimeError(f"iFlytek stream failed: {self._error}")
+        return "".join(self._results).strip()
+
+    def abort(self) -> None:
+        """Tear down without waiting (session superseded / cleanup)."""
+        self._done.set()
+        self._queue.put(self._LAST)
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    # ── worker threads ───────────────────────────────────────────────────────
+
+    def _sender(self) -> None:
+        """Drain the feed queue into 1280-byte iFlytek frames."""
+        if not self._connected.wait(timeout=5.0):
+            self._error = self._error or "connect timeout"
+            self._done.set()
+            return
+        first = True
+        pending = b""
+        try:
+            while True:
+                item = self._queue.get()
+                if item is self._LAST:
+                    break
+                pending += item
+                while len(pending) >= FRAME_SIZE:
+                    self._send_frame(FIRST_FRAME if first else MIDDLE_FRAME,
+                                     pending[:FRAME_SIZE])
+                    first = False
+                    pending = pending[FRAME_SIZE:]
+                    if self._queue.qsize() > 1:      # 积压时稍作节流
+                        time.sleep(FRAME_INTERVAL)
+            if pending:
+                self._send_frame(FIRST_FRAME if first else MIDDLE_FRAME, pending)
+                first = False
+            if first:                                # no audio at all
+                self._error = self._error or "no audio fed"
+                self._done.set()
+            else:
+                self._send_frame(LAST_FRAME, b"")
+        except Exception as e:
+            self._error = self._error or str(e)
+            self._done.set()
+
+    def _send_frame(self, status: int, chunk: bytes) -> None:
+        audio_b64 = base64.b64encode(chunk).decode("utf-8")
+        if status == FIRST_FRAME:
+            frame = {
+                "common": {"app_id": self._appid},
+                "business": {
+                    "domain": "iat",
+                    "language": "zh_cn",
+                    "accent": "mandarin",
+                    "vinfo": 1,
+                    "vad_eos": 10000,
+                },
+                "data": {
+                    "status": FIRST_FRAME,
+                    "format": "audio/L16;rate=16000",
+                    "audio": audio_b64,
+                    "encoding": "raw",
+                },
+            }
+        else:
+            frame = {
+                "data": {
+                    "status": status,
+                    "format": "audio/L16;rate=16000",
+                    "audio": audio_b64 if status != LAST_FRAME else "",
+                    "encoding": "raw",
+                },
+            }
+        self._ws.send(json.dumps(frame))
+
+    # ── WebSocket callbacks (ws thread) ──────────────────────────────────────
+
+    def _on_message(self, ws, message):
+        try:
+            resp = json.loads(message)
+            code = resp.get("code", -1)
+            if code != 0:
+                self._error = f"iFlytek error {code}: {resp.get('message', '')}"
+                self._done.set()
+                return
+            data = resp.get("data", {})
+            for item in data.get("result", {}).get("ws", []):
+                for cw in item.get("cw", []):
+                    if cw.get("w"):
+                        self._results.append(cw["w"])
+            if data.get("status", 0) == LAST_FRAME:
+                self._done.set()
+        except Exception as e:
+            self._error = str(e)
+            self._done.set()
+
+    def _on_error(self, ws, error):
+        self._error = self._error or str(error)
+        self._done.set()
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self._done.set()
+
+
 class XunfeiASR(ASREngine):
     """iFlytek streaming ASR via WebSocket.
 
@@ -70,6 +238,12 @@ class XunfeiASR(ASREngine):
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._recognize_sync, pcm_bytes)
+
+    def open_stream(self) -> XunfeiStreamSession:
+        """Create a live-feed session (call .start() to connect)."""
+        if not self._appid:
+            raise RuntimeError("XUNFEI_APPID not configured")
+        return XunfeiStreamSession(self._build_auth_url, self._appid)
 
     def _recognize_sync(self, pcm_bytes: bytes) -> str:
         """Synchronous recognition — runs in thread pool."""

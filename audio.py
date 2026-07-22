@@ -116,6 +116,40 @@ def resample_pcm(pcm_bytes: bytes, from_rate: int, to_rate: int) -> bytes:
     return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
 
 
+class StreamResampler24k16k:
+    """Stateful 24 kHz → 16 kHz resampler for streaming chunks (exact 3:2).
+
+    out[2m] = in[3m]; out[2m+1] = midpoint of in[3m+1], in[3m+2] — i.e. linear
+    interpolation at output positions k×1.5, matching resample_pcm() quality.
+    Input tail (len % 3 samples) is carried into the next process() call so
+    chunk boundaries stay phase-continuous.
+    """
+
+    def __init__(self):
+        self._carry = np.empty(0, dtype=np.int16)
+        self._byte_carry = b""            # odd trailing byte from a split sample
+
+    def process(self, pcm_bytes: bytes) -> bytes:
+        if self._byte_carry:
+            pcm_bytes = self._byte_carry + pcm_bytes
+            self._byte_carry = b""
+        if len(pcm_bytes) % 2:            # sample split across chunks — carry byte
+            self._byte_carry = pcm_bytes[-1:]
+            pcm_bytes = pcm_bytes[:-1]
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if self._carry.size:
+            samples = np.concatenate([self._carry, samples])
+        n_triplets = len(samples) // 3
+        self._carry = samples[n_triplets * 3:].copy()
+        if n_triplets == 0:
+            return b""
+        s = samples[:n_triplets * 3].astype(np.int32).reshape(-1, 3)
+        out = np.empty((n_triplets, 2), dtype=np.int16)
+        out[:, 0] = s[:, 0]
+        out[:, 1] = (s[:, 1] + s[:, 2]) >> 1
+        return out.tobytes()
+
+
 def chunk_pcm(pcm_bytes: bytes, chunk_size: int = PCM_CHUNK) -> list[bytes]:
     """Split PCM into chunks of `chunk_size` bytes (last chunk may be shorter).
 
