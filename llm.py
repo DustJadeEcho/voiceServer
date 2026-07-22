@@ -14,6 +14,12 @@ logger = logging.getLogger("llm")
 # Sentence-ending punctuation (Chinese + English)
 _SENTENCE_END = re.compile(r"[。！？!?\.\n]")
 
+# First TTS unit only: also cut at clause marks so synthesis starts ASAP.
+# TTS setup costs ~1.5s per request regardless of length, so only the FIRST
+# unit is worth shrinking; later units stay full sentences for prosody.
+_FIRST_CLAUSE_END = re.compile(r"[，,、；;：:。！？!?\.\n]")
+_MIN_FIRST_CLAUSE = 6           # 太短的碎片不值得单独起一次 TTS 请求
+
 # Fallback max characters per sentence if no punctuation found
 _MAX_SENTENCE_CHARS = 200
 
@@ -50,6 +56,7 @@ class LLMClient:
         buffer = ""
         t_start = loop.time()
         first_token_at: float | None = None
+        yielded_any = False
 
         try:
             stream = await loop.run_in_executor(None, self._create_stream, messages)
@@ -72,18 +79,25 @@ class LLMClient:
 
                 buffer += token
 
-                # Yield complete sentences
+                # Yield complete sentences (first unit: clause-level early cut)
                 while True:
-                    match = _SENTENCE_END.search(buffer)
-                    if match:
-                        cut_at = match.end()
-                        sentence = buffer[:cut_at].strip()
-                        buffer = buffer[cut_at:]
-                        if sentence:
-                            logger.debug("LLM sentence: %s", sentence[:60])
-                            yield sentence
+                    if yielded_any:
+                        match = _SENTENCE_END.search(buffer)
+                        cut_at = match.end() if match else 0
                     else:
+                        cut_at = 0
+                        for m in _FIRST_CLAUSE_END.finditer(buffer):
+                            if m.end() >= _MIN_FIRST_CLAUSE:
+                                cut_at = m.end()
+                                break
+                    if not cut_at:
                         break
+                    sentence = buffer[:cut_at].strip()
+                    buffer = buffer[cut_at:]
+                    if sentence:
+                        logger.debug("LLM sentence: %s", sentence[:60])
+                        yielded_any = True
+                        yield sentence
 
                 # If no punctuation and the buffer grows unbounded, soft-break it
                 if len(buffer) > _MAX_SENTENCE_CHARS * 2:
@@ -93,6 +107,7 @@ class LLMClient:
                         buffer = buffer[cut:]
                         if sentence:
                             logger.debug("LLM soft-break sentence: %s", sentence[:60])
+                            yielded_any = True
                             yield sentence
 
             # Flush remaining buffer

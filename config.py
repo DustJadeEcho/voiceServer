@@ -44,14 +44,19 @@ TTS_MODEL = os.environ.get("TTS_MODEL", "mimo-v2.5-tts")
 TTS_VOICE = os.environ.get("TTS_VOICE", "冰糖")
 TTS_STYLE = os.environ.get("TTS_STYLE", "温柔亲切，语速适中，像在和朋友聊天一样自然。")
 TTS_NATIVE_RATE = 24000  # Mimo TTS outputs 24kHz PCM16LE mono
+# Streaming synthesis (SSE): first audio ~1.5s vs 5-9s for the full clip.
+# Set TTS_STREAM=0 to fall back to non-streaming if the gateway breaks it.
+TTS_STREAM = os.environ.get("TTS_STREAM", "1") not in ("0", "false", "no")
 
 # ─── Audio / flow control ────────────────────────────────────────────────────
 DEVICE_SAMPLE_RATE = 16000      # device format: 16 kHz / 16-bit / mono
 DEVICE_BYTES_PER_SEC = DEVICE_SAMPLE_RATE * 2
-# MCU TTS ring buffer is 32 KB = 1.0 s. Pace the downlink so it never overflows:
+# MCU TTS ring buffer is 64 KB = 2.0 s. Pace the downlink so it never overflows:
 # an initial burst pre-fills the buffer, then send at real-time rate.
-DOWN_BURST_SECONDS = float(os.environ.get("DOWN_BURST_SECONDS", "0.6"))
-# stop(QoS1) may overtake the last audio chunks (QoS0) — wait briefly for stragglers
+DOWN_BURST_SECONDS = float(os.environ.get("DOWN_BURST_SECONDS", "1.0"))
+# stop(QoS1) may overtake the last audio chunks (QoS0) — the batch-ASR fallback
+# waits briefly for stragglers. The streaming-ASR path needs no grace (chunks
+# are fed live, in queue order, before stop is processed).
 STOP_GRACE_SECONDS = float(os.environ.get("STOP_GRACE_SECONDS", "0.3"))
 
 # ─── Limits ──────────────────────────────────────────────────────────────────

@@ -27,20 +27,23 @@ python3.12 -m venv .venv
 
 必填: `MQTT_HOST`(127.0.0.1，本机 broker)、`MQTT_PORT`(1883)、`MQTT_USERNAME/PASSWORD`、
 `XUNFEI_APPID/API_KEY/API_SECRET`、`LLM_BASE_URL/API_KEY/MODEL`、`TTS_BASE_URL/API_KEY/VOICE`。
-可调: `DOWN_BURST_SECONDS`(默认 0.6，勿超过 0.8——MCU 环形缓冲只有 1s)、
-`LLM_MAX_TOKENS`(默认 300)、`ASR_FRAME_INTERVAL_MS`(默认 10)。
+可调: `DOWN_BURST_SECONDS`(默认 1.0，勿超过 1.5——MCU 环形缓冲 64KB=2s)、
+`LLM_MAX_TOKENS`(默认 300)、`TTS_STREAM`(默认 1=流式合成；网关流式坏了设 0 回退整段合成)、
+`STOP_GRACE_SECONDS`(默认 0.3，仅批量 ASR 回退路径使用)。
 
 ## 4. 先手动跑通
 
 ```bash
 cd /opt/voiceServer
-.venv/bin/python test_apis.py     # 单测三个云 API（看 ASR/LLM/TTS 各自耗时）
-.venv/bin/python server.py        # 前台跑，板子开机做一轮问答，看日志
+.venv/bin/python test_apis.py          # 单测三个云 API（看 ASR/LLM/TTS 各自耗时）
+.venv/bin/python test_stream_e2e.py    # 流式全链路: 流式ASR→分句→流式TTS首块计时
+.venv/bin/python probe_latency.py      # 网关体检: 模型列表/TTFT/TTS流式支持（延时变差时先跑它）
+.venv/bin/python server.py             # 前台跑，板子开机做一轮问答，看日志
 ```
 
 期望日志顺序:
-`MQTT connected` → `Session created: <N>` → `stop: 24 chunks` → `ASR (2.x s): 你说的话`
-→ `LLM first token in X.XXs` → `TTS #0 ...` → `done: M packets`。
+`MQTT connected` → `Session created: <N>` → `Stop received, 24 chunks` → `ASR (stream, 0.3s): 你说的话`
+→ `LLM first token in X.XXs` → `TTS: 首句…` → `Session done`。
 
 ## 5. 注册 systemd 服务（开机自启+崩溃自拉，定名 voice-server）
 
@@ -64,14 +67,22 @@ journalctl -u voice-server -f               # 实时日志
 |---|---|
 | `MQTT connect failed` | EMQX 是否运行 `systemctl status emqx`；用户名密码与 MCU 侧一致 |
 | 板子收不到音频 | EMQX Dashboard 看两个客户端是否都在线；主题拼写（前导 `/` 必须一致） |
-| `LLM first token in >8s` | 上游网关慢——换 `LLM_BASE_URL`/`LLM_MODEL`（这是首响应延时的最大变量） |
+| `LLM first token in >8s` | 上游网关慢/抖动——跑 `probe_latency.py` 对比；必要时换 `LLM_BASE_URL`（实测本网关只有 MiMo 系，pro 已是最快，换模型无益） |
+| 日志出现 `TTS stream failed pre-audio` | 网关流式挂了，已自动回退整段合成（变慢但能用）；持续如此设 `TTS_STREAM=0` 并跑 probe 确认 |
+| 日志出现 `ASR stream failed ... falling back to batch` | 讯飞 WS 连不上/断线，自动回退批量识别（多 ~1.3s）；看服务器到 ws-api.xfyun.cn 的连通性 |
 | TTS 偶发 503 | 网关限流——流水线已限并发为"一步预取"，若仍频繁可加重试或换 TTS_BASE_URL |
-| MCU 播放断续 | `DOWN_BURST_SECONDS` 过大溢出环形缓冲（调回 0.6）或 WiFi 拥塞 |
+| MCU 播放断续 | `DOWN_BURST_SECONDS` 过大溢出环形缓冲（调回 1.0）或 WiFi 拥塞 |
 
-## 7. 延时账本（哪里还能压）
+## 7. 延时账本（2026-07-22 流式化改造后）
 
-一轮问答 = 录音(用户说话时长) + ASR(~2s) + **LLM 首 token(1~12s，取决于网关/模型)** +
-TTS 首句(~2.5s) + 下行传输(<0.5s)。后续句子已流水线化，边播边合成，无额外等待。
-压延时优先级: ① 换快的 LLM 网关/模型（看 `LLM first token` 日志数值）；
-② TTS 若支持流式改流式；③ ASR 改边录边传的流式识别（板端已按分片上传，服务器可改为
-收到分片即喂讯飞，stop 时立即拿结果，可再省 ~2s——留作下一步优化）。
+一轮问答（从板端 stop 到听到声音）= **ASR 收尾 ~0.3s + LLM 首 token 1.5~6s(网关抖动) +
+首单元出句 ~0.5s + TTS 流式首块 ~1.5s + 下行传输 <0.5s ≈ 4~8s**（改造前 12~14s）。
+
+已做的流水线化（都在 server 代码里，无需配置）:
+① **流式 TTS**（最大杠杆，省 3~5s）: 边合成边下发，首块 ~1.5s 到（整段合成实测 15字/5s、28字/9s）；
+② **流式 ASR**（省 ~1.3s）: 录音期间边收边喂讯飞，stop 即拿最终文本（`ASR (stream, 0.3s)`）；
+③ **首单元逗号切分**（省 ~0.5s）: 第一个 TTS 单元在第一个逗号处就开始合成，后续仍按整句保韵律。
+
+**剩余瓶颈 = LLM 首 token**（实测同一网关 TTFT 在 1.5~10s 间抖动，模型已是最快的 mimo-v2.5-pro）。
+要稳定进 5s 内，唯一有效手段是换更快的 LLM 网关/服务商（`LLM_BASE_URL`+`LLM_API_KEY`），
+换之前先用 `probe_latency.py` 实测候选网关的 TTFT。
