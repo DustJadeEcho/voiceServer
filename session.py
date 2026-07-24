@@ -4,6 +4,8 @@ State machine:
     IDLE → RECORDING → PROCESSING → SENDING → DONE / ERROR
 
 Latency/robustness features:
+    - Filler clip: a pre-synthesized "让我查一下" clip starts playing the moment
+      stop arrives (<1s perceived response); the real answer queues behind it.
     - Streaming ASR: uplink chunks are fed to iFlytek live during recording;
       stop → final text in ~0.3s (batch re-recognition only as fallback).
     - Streaming TTS: sentence audio is forwarded to the MCU as the gateway
@@ -52,6 +54,7 @@ class Session:
         llm: LLMClient,
         tts: TTSEngine,
         max_duration: int = 60,
+        filler_pcm: bytes = b"",
     ):
         self.session_id = session_id
         self.state = State.IDLE
@@ -67,6 +70,13 @@ class Session:
         self._task: asyncio.Task | None = None
         self._asr_stream = None              # live-feed ASR session (or None)
         self._send_buf = bytearray()         # accumulates stream PCM into full packets
+
+        # Filler clip: sent immediately on stop while ASR→LLM→TTS runs.
+        # The answer's packets must queue strictly *behind* it (the MCU plays
+        # in arrival order), so _send_audio_chunks awaits the filler task.
+        self._filler_pcm = filler_pcm
+        self._filler_task: asyncio.Task | None = None
+        self._down_seq = 0                   # continuous across filler + answer
 
         # Downlink pacing state (token bucket over wall clock)
         self._pace_t0: float | None = None
@@ -140,6 +150,11 @@ class Session:
         self.state = State.PROCESSING
         logger.info("[%s] Stop received, %d chunks (%d bytes)",
                     self.session_id, len(self._chunks), self._total_bytes)
+
+        # 垫场语音：不等 ASR/LLM/TTS，立刻开播——用户 1 秒内就听到回应，
+        # 真实回答由 _send_audio_chunks 的排队机制自然衔接在其后。
+        if self._filler_pcm:
+            self._filler_task = asyncio.create_task(self._send_filler())
 
         try:
             await asyncio.wait_for(
@@ -217,7 +232,6 @@ class Session:
 
         # ── Step 2: LLM stream → streaming TTS → paced downlink ─────────
         self.state = State.SENDING
-        down_seq = 0
         llm_interrupted = False
         sent_any = False
 
@@ -230,8 +244,7 @@ class Session:
                 self._send_buf += pcm_out
                 n_full = len(self._send_buf) // PCM_CHUNK * PCM_CHUNK
                 if n_full:
-                    down_seq = await self._send_audio_chunks(
-                        bytes(self._send_buf[:n_full]), down_seq)
+                    await self._send_audio_chunks(bytes(self._send_buf[:n_full]))
                     del self._send_buf[:n_full]
                     sent_any = True
         except _TTSAbort:
@@ -242,7 +255,7 @@ class Session:
             logger.error("[%s] LLM stream interrupted: %s", self.session_id, e)
 
         if self._send_buf:
-            down_seq = await self._send_audio_chunks(bytes(self._send_buf), down_seq)
+            await self._send_audio_chunks(bytes(self._send_buf))
             self._send_buf.clear()
             sent_any = True
 
@@ -341,8 +354,43 @@ class Session:
                 raise _TTSAbort() from e
             # single failure → skip this sentence
 
-    async def _send_audio_chunks(self, pcm_data: bytes, start_seq: int) -> int:
-        """Send PCM as paced packets. Returns next sequence number.
+    # ── Filler clip ──────────────────────────────────────────────────────────
+
+    async def _send_filler(self) -> None:
+        """Send the pre-synthesized filler clip through the normal paced path."""
+        logger.info("[%s] Sending filler clip (%.1fs)", self.session_id,
+                    len(self._filler_pcm) / config.DEVICE_BYTES_PER_SEC)
+        await self._send_audio_chunks(self._filler_pcm)
+
+    async def _wait_filler(self) -> None:
+        """Block until the filler clip is fully sent (no-op when none/self)."""
+        task = self._filler_task
+        if task is None or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():             # filler cancelled, not us — continue
+                pass
+            else:
+                raise
+        except Exception as e:
+            logger.warning("[%s] Filler send failed: %s", self.session_id, e)
+        finally:
+            if task.done():
+                self._filler_task = None
+
+    def _cancel_filler(self) -> None:
+        if self._filler_task is not None and not self._filler_task.done():
+            self._filler_task.cancel()
+        self._filler_task = None
+
+    async def _send_audio_chunks(self, pcm_data: bytes) -> None:
+        """Send PCM as paced packets, continuing the session sequence number.
+
+        Ordering: the MCU plays packets in arrival order, so the answer must
+        wait until the filler clip has been fully published — every caller
+        except the filler task itself blocks on _wait_filler() first.
 
         Pacing: token bucket with **capped** capacity (= DOWN_BURST_SECONDS).
         Unlike an open-ended "burst + elapsed×rate" budget, the bucket cannot
@@ -350,6 +398,8 @@ class Session:
         packets resume at real-time rate instead of flooding the MCU ring
         (observed: 4 s stall → catch-up burst → ring overflow, 0.5 s dropped).
         """
+        await self._wait_filler()
+
         loop = asyncio.get_running_loop()
         burst_bytes = config.DOWN_BURST_SECONDS * config.DEVICE_BYTES_PER_SEC
         if self._pace_t0 is None:                 # first send: full bucket
@@ -357,7 +407,6 @@ class Session:
             self._pace_tokens = burst_bytes
             self._pace_last = self._pace_t0
 
-        seq = start_seq
         for chunk in chunk_pcm(pcm_data):
             # Refill tokens at real-time rate, capped at bucket size
             now = loop.time()
@@ -373,21 +422,22 @@ class Session:
                 self._pace_last = loop.time()
             self._pace_tokens -= len(chunk)
 
-            packet = encode_packet(self.session_id, seq, chunk)
+            packet = encode_packet(self.session_id, self._down_seq, chunk)
             await self._publish(config.TOPIC_DOWN_AUDIO, packet, 0)  # QoS 0
             self._pace_sent += len(chunk)
-            seq += 1
-        return seq
+            self._down_seq += 1
 
     # ── Control messages ────────────────────────────────────────────────────
 
     async def _send_done(self) -> None:
+        await self._wait_filler()        # done 不能越过仍在下发的垫场音频
         msg = json.dumps({"event": "done", "session": self.session_id})
         await self._publish(config.TOPIC_DOWN_CONTROL, msg.encode(), 1)  # QoS 1
         self.state = State.DONE
         logger.info("[%s] Session done", self.session_id)
 
     async def _send_error(self, reason: str) -> None:
+        self._cancel_filler()            # 出错即中止垫场，别再耗带宽
         msg = json.dumps({"event": "error", "session": self.session_id, "reason": reason})
         await self._publish(config.TOPIC_DOWN_CONTROL, msg.encode(), 1)  # QoS 1
         self.state = State.ERROR
@@ -398,6 +448,7 @@ class Session:
         if self._asr_stream is not None:
             self._asr_stream.abort()
             self._asr_stream = None
+        self._cancel_filler()
         self._chunks.clear()
         self._total_bytes = 0
         if self._task and not self._task.done():

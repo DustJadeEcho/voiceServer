@@ -22,6 +22,7 @@ import config
 from asr import create_asr_engine
 from audio import decode_packet
 from llm import LLMClient
+from sensors import SensorStore
 from session import Session
 from tts import TTSEngine
 
@@ -39,12 +40,13 @@ logger = logging.getLogger("server")
 class SessionManager:
     """Manages active sessions with limits and timeouts."""
 
-    def __init__(self, asr, llm, tts, publish_fn):
+    def __init__(self, asr, llm, tts, publish_fn, filler_pcm: bytes = b""):
         self._sessions: dict[int, Session] = {}
         self._asr = asr
         self._llm = llm
         self._tts = tts
         self._publish = publish_fn
+        self._filler_pcm = filler_pcm
 
     @property
     def count(self) -> int:
@@ -71,6 +73,7 @@ class SessionManager:
             llm=self._llm,
             tts=self._tts,
             max_duration=max_duration,
+            filler_pcm=self._filler_pcm,
         )
         self._sessions[session_id] = session
         logger.info("Session created: %s (%d/%d active)",
@@ -95,6 +98,33 @@ class SessionManager:
             self.remove(sid)
 
 
+# ─── Filler clip loading ─────────────────────────────────────────────────────
+def _load_filler_pcm() -> bytes:
+    """Load the pre-synthesized filler clip (16k/16bit/mono raw PCM).
+
+    Missing/empty file or FILLER_ENABLED=0 → b"" (feature off, not an error):
+    the server must keep working before gen_filler.py has ever been run.
+    """
+    if not config.FILLER_ENABLED:
+        logger.info("Filler clip disabled (FILLER_ENABLED=0)")
+        return b""
+    try:
+        with open(config.FILLER_PCM_PATH, "rb") as f:
+            pcm = f.read()
+    except OSError:
+        logger.warning("Filler clip not found at %s — run gen_filler.py to enable",
+                       config.FILLER_PCM_PATH)
+        return b""
+    if len(pcm) % 2:                      # keep 16-bit sample alignment
+        pcm = pcm[:-1]
+    if not pcm:
+        logger.warning("Filler clip %s is empty, ignoring", config.FILLER_PCM_PATH)
+        return b""
+    logger.info("Filler clip loaded: %.1fs (%d bytes)",
+                len(pcm) / config.DEVICE_BYTES_PER_SEC, len(pcm))
+    return pcm
+
+
 # ─── Main Server ─────────────────────────────────────────────────────────────
 class VoiceServer:
     """Main voice server — MQTT client + asyncio event loop."""
@@ -107,10 +137,16 @@ class VoiceServer:
             protocol=mqtt.MQTTv311,
         )
 
+        # Sensor cache (water / GPS frames → LLM prompt context)
+        self._sensors = SensorStore()
+
         # AI engines
         self._asr = create_asr_engine()
-        self._llm = LLMClient()
+        self._llm = LLMClient(context_provider=self._sensors.prompt_context)
         self._tts = TTSEngine()
+
+        # Filler clip: played the moment stop arrives, masking pipeline latency
+        self._filler_pcm = _load_filler_pcm()
 
         # Session manager
         self._sessions = SessionManager(
@@ -118,6 +154,7 @@ class VoiceServer:
             llm=self._llm,
             tts=self._tts,
             publish_fn=self._async_publish,
+            filler_pcm=self._filler_pcm,
         )
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -192,11 +229,14 @@ class VoiceServer:
         if reason_code == 0:
             logger.info("MQTT connected")
             client.subscribe([
-                (config.TOPIC_UP_AUDIO, 0),    # audio: QoS 0
-                (config.TOPIC_UP_CONTROL, 1),  # control: QoS 1
+                (config.TOPIC_UP_AUDIO, 0),      # audio: QoS 0
+                (config.TOPIC_UP_CONTROL, 1),    # control: QoS 1
+                (config.TOPIC_SENSOR_WATER, 0),  # sensor frames: latest-wins
+                (config.TOPIC_SENSOR_GPS, 0),
             ])
-            logger.info("Subscribed: %s , %s",
-                        config.TOPIC_UP_AUDIO, config.TOPIC_UP_CONTROL)
+            logger.info("Subscribed: %s , %s , %s , %s",
+                        config.TOPIC_UP_AUDIO, config.TOPIC_UP_CONTROL,
+                        config.TOPIC_SENSOR_WATER, config.TOPIC_SENSOR_GPS)
         else:
             logger.error("MQTT connect failed: %s", reason_code)
 
@@ -226,6 +266,10 @@ class VoiceServer:
             await self._handle_control(payload)
         elif topic == config.TOPIC_UP_AUDIO:
             await self._handle_audio(payload)
+        elif topic == config.TOPIC_SENSOR_WATER:
+            self._sensors.handle_frame("water", payload)
+        elif topic == config.TOPIC_SENSOR_GPS:
+            self._sensors.handle_frame("gps", payload)
         else:
             logger.debug("Unknown topic: %s", topic)
 
@@ -263,10 +307,14 @@ class VoiceServer:
 
         elif event == "stop":
             session = self._sessions.get(session_id)
-            if session:
-                session._task = asyncio.create_task(self._process_session(session))
-            else:
+            if session is None:
                 logger.warning("Stop for unknown session %s", session_id)
+            elif session._task is not None:
+                # stop 走 QoS1，可能重复投递——二次处理会在 finally 里移除
+                # 会话，掐死仍在跑的流水线/垫场下发
+                logger.info("Duplicate stop for session %s, ignoring", session_id)
+            else:
+                session._task = asyncio.create_task(self._process_session(session))
 
         else:
             logger.warning("Unknown control event: %s", event)

@@ -21,6 +21,22 @@ TOPIC_UP_CONTROL = "/qhmu/lele/mcu/audio/wm8978/control"
 TOPIC_DOWN_AUDIO = "/qhmu/lele/mcu/audio/pcm/down"
 TOPIC_DOWN_CONTROL = "/qhmu/lele/mcu/audio/ubuntu/control"
 
+# Sensor topics — raw 64-byte frames republished by the ctrl board (qhmu_water_ctrl)
+TOPIC_SENSOR_WATER = "/qhmu/lele/mcu/water"
+TOPIC_SENSOR_GPS = "/qhmu/lele/mcu/gps"
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ─── Sensor data (cache → LLM prompt, JSONL log for restart warm-up) ─────────
+SENSOR_LOG_DIR = os.environ.get("SENSOR_LOG_DIR", os.path.join(_BASE_DIR, "data"))
+SENSOR_STALE_SECONDS = int(os.environ.get("SENSOR_STALE_SECONDS", "300"))
+
+# ─── Filler clip (played instantly on stop while ASR→LLM→TTS runs) ──────────
+# 16 kHz / 16-bit / mono raw PCM, pre-synthesized with gen_filler.py.
+# Missing file = feature off. FILLER_ENABLED=0 disables without deleting.
+FILLER_PCM_PATH = os.environ.get("FILLER_PCM_PATH", os.path.join(_BASE_DIR, "filler.pcm"))
+FILLER_ENABLED = os.environ.get("FILLER_ENABLED", "1") not in ("0", "false", "no")
+
 # ─── ASR (iFlytek 语音听写 流式版) ───────────────────────────────────────────
 XUNFEI_APPID = os.environ.get("XUNFEI_APPID", "")
 XUNFEI_API_KEY = os.environ.get("XUNFEI_API_KEY", "")
