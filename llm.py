@@ -11,13 +11,17 @@ import config
 
 logger = logging.getLogger("llm")
 
-# Sentence-ending punctuation (Chinese + English)
-_SENTENCE_END = re.compile(r"[。！？!?\.\n]")
+# Sentence-ending punctuation (Chinese + English).
+# ASCII "." only ends a sentence when the next char is a non-digit — a bare
+# "29." at the buffer tail waits for more tokens, so decimals like 29.1 are
+# never split into "29." / "1度" (the final flush covers a true stream end).
+_SENTENCE_END = re.compile(r"[。！？!?\n]|\.(?=\D)")
 
 # First TTS unit only: also cut at clause marks so synthesis starts ASAP.
 # TTS setup costs ~1.5s per request regardless of length, so only the FIRST
 # unit is worth shrinking; later units stay full sentences for prosody.
-_FIRST_CLAUSE_END = re.compile(r"[，,、；;：:。！？!?\.\n]")
+# ASCII "." and "," get the same digit guard (3.95ppm / 1,000).
+_FIRST_CLAUSE_END = re.compile(r"[，、；;：:。！？!?\n]|[.,](?=\D)")
 _MIN_FIRST_CLAUSE = 6           # 太短的碎片不值得单独起一次 TTS 请求
 
 # Fallback max characters per sentence if no punctuation found
@@ -69,6 +73,9 @@ class LLMClient:
         t_start = loop.time()
         first_token_at: float | None = None
         yielded_any = False
+        n_chunks = 0                 # 空流诊断: 收到的 SSE chunk 数
+        n_reasoning = 0              # 空流诊断: 只带 reasoning_content 的 chunk 数
+        finish_reason = None
 
         try:
             stream = await loop.run_in_executor(None, self._create_stream, messages)
@@ -78,10 +85,16 @@ class LLMClient:
                 chunk = await loop.run_in_executor(None, _next_or_none, stream_iter)
                 if chunk is None:
                     break
+                n_chunks += 1
                 if not chunk.choices:
                     continue
-                token = chunk.choices[0].delta.content or ""
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                token = choice.delta.content or ""
                 if not token:
+                    if getattr(choice.delta, "reasoning_content", None):
+                        n_reasoning += 1
                     continue
                 if first_token_at is None:
                     first_token_at = loop.time()
@@ -125,7 +138,16 @@ class LLMClient:
             # Flush remaining buffer
             if buffer.strip():
                 logger.debug("LLM flush: %s", buffer.strip()[:60])
+                yielded_any = True
                 yield buffer.strip()
+
+            # 网关偶发 HTTP 200 但整条流无任何 content——记录细节供排查
+            # （reasoning 模型可能只吐 reasoning_content；也可能是空 choices）
+            if not yielded_any:
+                logger.warning(
+                    "LLM stream ended with NO content: %d chunks, "
+                    "%d reasoning-only, finish_reason=%s",
+                    n_chunks, n_reasoning, finish_reason)
 
         except Exception as e:
             logger.error("LLM stream error: %s", e)
