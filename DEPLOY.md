@@ -38,12 +38,30 @@ cd /opt/voiceServer
 .venv/bin/python test_apis.py          # 单测三个云 API（看 ASR/LLM/TTS 各自耗时）
 .venv/bin/python test_stream_e2e.py    # 流式全链路: 流式ASR→分句→流式TTS首块计时
 .venv/bin/python probe_latency.py      # 网关体检: 模型列表/TTFT/TTS流式支持（延时变差时先跑它）
+.venv/bin/python gen_filler.py         # 生成垫场语音 filler.pcm（一次即可；换文案/音色后重跑）
 .venv/bin/python server.py             # 前台跑，板子开机做一轮问答，看日志
 ```
 
 期望日志顺序:
-`MQTT connected` → `Session created: <N>` → `Stop received, 24 chunks` → `ASR (stream, 0.3s): 你说的话`
-→ `LLM first token in X.XXs` → `TTS: 首句…` → `Session done`。
+`MQTT connected` → `Session created: <N>` → `Stop received, 24 chunks` → `Sending filler clip`
+→ `ASR (stream, 0.3s): 你说的话` → `LLM first token in X.XXs` → `TTS: 首句…` → `Session done`。
+
+## 4.5 船载传感器数据（水质/GPS → LLM 提示词）
+
+服务器额外订阅 `/qhmu/lele/mcu/water` 和 `/qhmu/lele/mcu/gps`（ctrl 板原样转发的
+64 字节小端帧，见 `sensors.py` 头注释）。最新值进内存缓存并追加到 `data/*.jsonl`；
+LLM 每次请求把缓存注入 system prompt（超过 `SENSOR_STALE_SECONDS`=300s 标注过期）。
+MCU 发布不带 retain，重启后从日志尾行回填缓存，无需等下一次上报。
+注意 ctrl 板把**所有非 GPS 帧**都发往 water 主题（含连接应答等），服务器按帧内
+type 字段过滤，日志出现 `Dropping water frame: type N` 属正常。
+
+## 4.6 垫场语音（感知延迟优化）
+
+收到 stop 的瞬间即下发预合成的 `filler.pcm`（"好的，我先查询水质和定位数据…"），
+真实回答排在其后无缝衔接——用户 1 秒内听到回应，而不是静默等 4~8s。
+`gen_filler.py` 用与回答相同的音色合成（本地 Windows 网络下整段合成慢，
+需 `API_TIMEOUT=90` 环境变量；服务器上默认值即可）。文件缺失仅告警不影响运行；
+`FILLER_ENABLED=0` 可临时关闭。文案改短 = 好情况下更早听到真实回答。
 
 ## 5. 注册 systemd 服务（开机自启+崩溃自拉，定名 voice-server）
 

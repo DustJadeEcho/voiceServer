@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from openai import OpenAI
 
@@ -31,7 +31,7 @@ class LLMClient:
     to avoid blocking the asyncio event loop.
     """
 
-    def __init__(self):
+    def __init__(self, context_provider: Callable[[], str] | None = None):
         self._client = OpenAI(
             api_key=config.LLM_API_KEY,
             base_url=config.LLM_BASE_URL,
@@ -39,6 +39,8 @@ class LLMClient:
         )
         self._model = config.LLM_MODEL
         self._system_prompt = config.LLM_SYSTEM_PROMPT
+        # 每次请求时调用，返回追加到 system prompt 的实时上下文（船载传感器数据）
+        self._context_provider = context_provider
 
     async def stream_sentences(self, user_text: str) -> AsyncGenerator[str, None]:
         """Stream LLM response, yielding complete sentences one at a time.
@@ -47,8 +49,18 @@ class LLMClient:
         in a coroutine would block the whole event loop between tokens. Every
         next() is therefore pushed to the default thread pool.
         """
+        system_prompt = self._system_prompt
+        if self._context_provider is not None:
+            try:
+                context = self._context_provider()
+            except Exception as e:
+                logger.warning("Context provider failed, continuing without: %s", e)
+                context = ""
+            if context:
+                system_prompt = f"{system_prompt}\n\n{context}"
+
         messages = [
-            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ]
 
