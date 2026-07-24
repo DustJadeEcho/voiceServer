@@ -29,6 +29,9 @@ from tts import TTSEngine
 
 logger = logging.getLogger("session")
 
+# LLM 连续两次空流时的兜底播报（走非流式 TTS，一次合成整句）
+_LLM_EMPTY_FALLBACK = "抱歉，我刚才没有组织好语言，请再问我一次吧。"
+
 
 class State(enum.Enum):
     IDLE = "idle"
@@ -235,29 +238,51 @@ class Session:
         llm_interrupted = False
         sent_any = False
 
-        try:
-            async for pcm_out in self._tts_pipeline(text):
-                if not pcm_out:
-                    continue
-                # Accumulate stream chunks into full packets; the tail is
-                # flushed after the pipeline ends (MCU accepts short packets).
-                self._send_buf += pcm_out
-                n_full = len(self._send_buf) // PCM_CHUNK * PCM_CHUNK
-                if n_full:
-                    await self._send_audio_chunks(bytes(self._send_buf[:n_full]))
-                    del self._send_buf[:n_full]
-                    sent_any = True
-        except _TTSAbort:
-            await self._send_error("tts_failed")
-            return
-        except Exception as e:
-            llm_interrupted = True
-            logger.error("[%s] LLM stream interrupted: %s", self.session_id, e)
+        # 网关偶发返回 HTTP 200 但整条流无任何 content token——不报异常也不产
+        # 音频，设备只听到垫场语音就收到 done。空流重试一次，仍空则播兜底句。
+        for attempt in (1, 2):
+            try:
+                async for pcm_out in self._tts_pipeline(text):
+                    if not pcm_out:
+                        continue
+                    # Accumulate stream chunks into full packets; the tail is
+                    # flushed after the pipeline ends (MCU accepts short packets).
+                    self._send_buf += pcm_out
+                    n_full = len(self._send_buf) // PCM_CHUNK * PCM_CHUNK
+                    if n_full:
+                        await self._send_audio_chunks(bytes(self._send_buf[:n_full]))
+                        del self._send_buf[:n_full]
+                        sent_any = True
+            except _TTSAbort:
+                await self._send_error("tts_failed")
+                return
+            except Exception as e:
+                llm_interrupted = True
+                logger.error("[%s] LLM stream interrupted: %s", self.session_id, e)
+            if sent_any or self._send_buf or llm_interrupted:
+                break
+            if attempt == 1:
+                logger.warning("[%s] LLM produced no audio, retrying once",
+                               self.session_id)
 
         if self._send_buf:
             await self._send_audio_chunks(bytes(self._send_buf))
             self._send_buf.clear()
             sent_any = True
+
+        if not sent_any and not llm_interrupted:
+            logger.warning("[%s] LLM empty twice, sending canned fallback",
+                           self.session_id)
+            try:
+                pcm = await self._tts.synthesize(_LLM_EMPTY_FALLBACK)
+                if pcm:
+                    await self._send_audio_chunks(pcm)
+                    sent_any = True
+            except Exception as e:
+                logger.error("[%s] Fallback TTS failed: %s", self.session_id, e)
+            if not sent_any:
+                await self._send_error("llm_failed")
+                return
 
         # ── Step 3: completion signal ────────────────────────────────────
         if llm_interrupted and not sent_any:
