@@ -148,6 +148,12 @@ class LLMClient:
                     "LLM stream ended with NO content: %d chunks, "
                     "%d reasoning-only, finish_reason=%s",
                     n_chunks, n_reasoning, finish_reason)
+            elif finish_reason == "length":
+                # 推理模型的思考 token 计入 max_tokens，正文被中途掐断
+                logger.warning(
+                    "LLM answer TRUNCATED by max_tokens=%d "
+                    "(%d reasoning-only chunks) — raise LLM_MAX_TOKENS",
+                    config.LLM_MAX_TOKENS, n_reasoning)
 
         except Exception as e:
             logger.error("LLM stream error: %s", e)

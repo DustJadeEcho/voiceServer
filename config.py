@@ -46,7 +46,10 @@ XUNFEI_API_SECRET = os.environ.get("XUNFEI_API_SECRET", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "300"))  # 语音场景回答上限
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
+# 注意: 网关是 MiMo 系推理模型，思考(reasoning)token 也计入 max_tokens——
+# 300 时思考常烧掉大半额度，正文说到一半被 length 掐断（甚至整条为空）。
+# 1000 = 思考余量 + 200字口语回答；回答长度靠 system prompt 约束，不靠截断。
 LLM_SYSTEM_PROMPT = os.environ.get(
     "LLM_SYSTEM_PROMPT",
     "你是一个友好的语音助手，请用简洁的中文回答用户的问题。回答要口语化，适合语音播放，"
