@@ -20,7 +20,7 @@ import config
 from audio import pcm_to_wav
 from tts import TTSEngine
 
-DEFAULT_TEXT = "好的，我先来查询一下现在的水质数据和定位信息，请您稍等几秒钟。"
+DEFAULT_TEXT = "好的，我正在思考中，请您稍等几秒钟。"
 
 
 async def main() -> None:
