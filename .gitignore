@@ -1,3 +1,6 @@
 __pycache__/
-data/
 filler.wav
+filler.pcm
+.env
+.env.*
+!.env.example
